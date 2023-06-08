@@ -1,0 +1,272 @@
+/* num(=3)回位相シフト縞投影した計測物体撮影画像から三次元点群作成＆保存 */
+/* 入力：撮影画像(num枚) */
+/* 出力：三次元点群 */
+/* 準備：カメラパラメータ・LUT */
+/* 使用言語：c++ */
+
+#include <fstream>
+#include <boost/program_options.hpp>
+#include <opencv2/opencv.hpp>
+#include "matplotlib-cpp/matplotlibcpp.h" //<matplotlib-cpp/matplotlibcpp.h>
+#define _USE_MATH_DEFINES
+#include <math.h> //M_PI(円周率)利用のため追加
+
+/* 関数：カメラのレンズ歪みパラメータdist、内部パラメータmtx読み込み */
+bool
+loadIntrinsicParams(cv::Mat& mtx, cv::Mat& dist)
+{
+    std::ifstream f("C:/Users/owner/source/repos/05_3D_measurement/3D_measurement/intrinsicParams.dat", std::ios::in | std::ios::binary); //カメラパラメータの絶対位置に変更  ##intrinsicParams.datの絶対位置##
+    if (!f) {
+        return false;
+    }
+    for (int row = 0; row < mtx.rows; row++) {
+        for (int col = 0; col < mtx.cols; col++) {
+            f.read(reinterpret_cast<char*>(&(mtx.at<double>(row, col))), sizeof(double));
+        }
+    }
+    for (int row = 0; row < dist.rows; row++) {
+        for (int col = 0; col < dist.cols; col++) {
+            f.read(reinterpret_cast<char*>(&(dist.at<double>(row, col))), sizeof(double));
+        }
+    }
+    f.close();
+    return true;
+}
+
+/* 関数：3stepシフト法による相対位相導出 */
+void
+calculateRphases3(float* in, float* rphase, float* amplitude, float* bias)
+{
+    *bias = (in[0] + in[1] + in[2]) / 3.0f;
+    *amplitude = sqrtf((2.0f * in[0] - in[1] - in[2]) * (2.0f * in[0] - in[1] - in[2])
+        + 3.0f * (in[1] - in[2]) * (in[1] - in[2])) / 3.0f;
+    *rphase = atan2f(sqrtf(3.0f) * (in[2] - in[1]), 2.0f * in[0] - in[1] - in[2]);
+}
+
+/* 関数：縞波形、振幅、バイアス表示 */
+void
+plotSinusoidalWaves(cv::Mat sinusoidalwaves[], cv::Mat& amplitude, cv::Mat& bias,
+    const int num)
+{
+    int row = sinusoidalwaves[0].rows / 2;
+    int cols = sinusoidalwaves[0].cols;
+    std::vector<float> u, v[3 + 2]; //  ##ステップ数(今は3)##
+    std::ostringstream ss;
+
+    for (int col = 0; col < cols; col++) {
+        u.push_back(col);
+        for (int i = 0; i < num; i++) {
+            v[i].push_back(sinusoidalwaves[i].at<float>(row, col));
+        }
+        v[num].push_back(amplitude.at<float>(row, col));
+        v[num + 1].push_back(bias.at<float>(row, col));
+    }
+    //matplotlibcpp::title("Pixel Values");
+    //matplotlibcpp::xlabel("x (pixel)");
+    matplotlibcpp::xlim(0, cols);
+    matplotlibcpp::ylim(0, 255);
+
+
+    for (int i = 0; i < 1; i++) { //位相シフト分すべて表示：for (int i = 0; i < num; i++)／sinusoidaiwaves[0](位相シフト無しのやつ)だけ表示：for (int i = 0; i < 1; i++)
+        std::string title = "pixel values (phase ";
+        ss << i;
+        title.append(ss.str());
+        title.append(")");
+        matplotlibcpp::named_plot(title, u, v[i]);
+        ss.str("");
+    }
+    //matplotlibcpp::named_plot("amplitudes", u, v[num]);   //振幅をプロットする／しない
+    //matplotlibcpp::named_plot("biases", u, v[num + 1]);   //バイアスをプロットする／しない
+    //matplotlibcpp::legend();                              //凡例を表示する／しない
+    matplotlibcpp::show();
+    u.clear();
+    for (int i = 0; i < num + 2; i++) {
+        v[i].clear();
+    }
+}
+
+/* 関数：相対位相、正規化振幅、正規化バイアス表示 */
+void
+plotRelativePhases(cv::Mat& rphase, cv::Mat& amplitude, cv::Mat& bias)
+{
+    int row = rphase.rows / 2;
+    int cols = rphase.cols;
+    float scaleparam = 3.0f / 255.0f;
+    std::vector<float> u(cols), v0(cols), v1(cols), v2(cols);
+    for (int col = 0; col < cols; col++) {
+        u[col] = col;
+        v0[col] = rphase.at<float>(row, col);
+        v1[col] = scaleparam * amplitude.at<float>(row, col);
+        v2[col] = scaleparam * bias.at<float>(row, col);
+    }
+    matplotlibcpp::title("Relative Phases");
+    matplotlibcpp::xlabel("x (pixel)");
+    matplotlibcpp::xlim(0, cols);
+    matplotlibcpp::ylim(-M_PI, M_PI);
+    matplotlibcpp::named_plot("relative phases", u, v0);
+    //matplotlibcpp::named_plot("amplitudes normalized between [0, 3]", u, v1); //正規化振幅をプロットする／しない
+    //matplotlibcpp::named_plot("biases normalized between [0, 3]", u, v2);     //正規化バイアスをプロットする／しない
+    //matplotlibcpp::legend();                                                  //凡例を表示する／しない
+    matplotlibcpp::show();
+}
+
+/* 関数：閾値処理 */
+void
+thresholdAmplitudes(cv::Mat& rphase, cv::Mat& amplitude, float threshold)
+{
+    cv::Mat amp = cv::Mat::zeros(amplitude.rows, amplitude.cols, CV_32FC1);
+    for (int row = 0; row < amp.rows; row++) {
+        for (int col = 0; col < amp.cols; col++) {
+            if (amplitude.at<float>(row, col) < threshold) {
+                rphase.at<float>(row, col) = -FLT_MAX;
+            }
+            else {
+                amp.at<float>(row, col) = 255.0f;
+            }
+        }
+    }
+    matplotlibcpp::imshow(&(amp.at<float>(0, 0)), amp.rows, amp.cols, 1);
+    matplotlibcpp::axis("off");
+    matplotlibcpp::show();
+}
+
+/* 関数：LUT読み込み */
+bool
+loadLUTs(cv::Mat LUTrphase[2], cv::Mat LUTcoordv[2])
+{
+    cv::FileStorage fs("LUTs.xml", cv::FileStorage::READ);      //※03で作成したLUTs.xmlをコピペしておく
+    if (!fs.isOpened())
+        return false;
+    fs["LUTatNearEnd"] >> LUTrphase[0];
+    fs["CoordinateValuesatNearEnd"] >> LUTcoordv[0];
+    fs["LUTatFarEnd"] >> LUTrphase[1];
+    fs["CoordinateValuesatFarEnd"] >> LUTcoordv[1];
+    fs.release();
+    return true;
+}
+
+/* 関数：三次元点群導出 */
+void
+convertRphasetoCoordv(cv::Mat& rphase, std::vector<double>& x, std::vector<double>& y, std::vector<double>& z,
+    cv::Mat LUTrphase[2], cv::Mat LUTcoordv[2], int steprow, int stepcol)
+{
+    const float znear = 475.0f, zfar = 525.0f;          //最前面位置、最後面位置[mm]     ##カメラ位置##
+    for (int row = 0; row < rphase.rows; row += steprow) {
+        for (int col = 0; col < rphase.cols; col += stepcol) {
+            if (LUTrphase[0].at<float>(row, col) == -FLT_MAX || rphase.at<float>(row, col) == -FLT_MAX) {
+                continue;
+            }
+            if (rphase.at<float>(row, col) < LUTrphase[0].at<float>(row, col)) {
+                rphase.at<float>(row, col) += 2.0f * static_cast<float>(M_PI);
+            }
+            if (rphase.at<float>(row, col) > LUTrphase[1].at<float>(row, col) ||
+                rphase.at<float>(row, col) < LUTrphase[0].at<float>(row, col)) {
+                continue;
+            }
+            float ratio = (rphase.at<float>(row, col) - LUTrphase[0].at<float>(row, col))
+                / (LUTrphase[1].at<float>(row, col) - LUTrphase[0].at<float>(row, col));
+            float X = (LUTcoordv[1].at<cv::Vec3f>(row, col)[0] - LUTcoordv[0].at<cv::Vec3f>(row, col)[0])
+                * ratio + LUTcoordv[0].at<cv::Vec3f>(row, col)[0];
+            float Y = (LUTcoordv[1].at<cv::Vec3f>(row, col)[1] - LUTcoordv[0].at<cv::Vec3f>(row, col)[1])
+                * ratio + LUTcoordv[0].at<cv::Vec3f>(row, col)[1];
+            float Z = (zfar - znear) * ratio + znear;
+            x.push_back(X);
+            y.push_back(Y);
+            z.push_back(Z);
+        }
+    }
+}
+
+/* 関数：三次元点群保存 */
+void
+saveCoordv(std::vector<double>& x, std::vector<double>& y, std::vector<double>& z)
+{
+    std::ofstream f("./3D.asc", std::ios::out);
+    for (int i = 0; i < x.size(); i++) {
+        f << x[i] << "," << y[i] << "," << z[i] << std::endl;
+    }
+    f.close();
+}
+
+/* main関数 */
+int
+main(int argc, char* argv[])
+{
+    /* 変数等定義 */
+    const int num = 3;          //##ステップ数##
+    const int threshold = 10;   //##閾値##
+    cv::Mat frame[num];         //frame:読み込み画像
+    cv::Mat undistortedframe[num];//undistortedframe:歪み補正画像
+
+    /* カメラ内部パラメータ読み込み */
+    cv::Mat mtx = cv::Mat(3, 3, CV_64FC1), dist = cv::Mat(1, 5, CV_64FC1);
+    if (!loadIntrinsicParams(mtx, dist)) {
+        std::cerr << "file (intrinsic parameters) open error" << std::endl;
+        return -1;
+    }
+
+    /* 複数画像読み込み */
+        //読み込み画像は"pic/jikkenn(simuration)/2023****_f**/"に入れておく
+    for (int a = 0; a < num; a++) {
+        std::ostringstream ass;
+        ass << std::setfill('0') << std::setw(1) << a + 1;
+        frame[a] = cv::imread("./pic/simulation/20230209_f042_cal_cal/predict" + ass.str() + ".bmp");          //frame[0~2]に撮影画像読み込み   ##画像位置## predict
+        printf("%d", a);
+    }
+
+    /* 画像のレンズ歪み補正 */
+    for (int i = 0; i < num; i++) {
+        cv::undistort(frame[i], undistortedframe[i], mtx, dist);
+    }
+
+    /* 縞波形、相対位相等計算 */
+    cv::Mat sinusoidalwaves[num];
+    for (int j = 0; j < num; j++)
+        sinusoidalwaves[j] = cv::Mat(480, 640, CV_32FC1);
+    cv::Mat amplitude = cv::Mat(480, 640, CV_32FC1);
+    cv::Mat bias = cv::Mat(480, 640, CV_32FC1);
+    cv::Mat rphase = cv::Mat(480, 640, CV_32FC1);
+    cv::Mat coord = cv::Mat(480, 640, CV_32FC3);
+    float gamma = 1.00f;    //カメラのガンマ値1.00に設定したため変更     ##カメラ(ガンマ値の逆数)##
+    for (int row = 0; row < undistortedframe[0].rows; row++) {
+        for (int col = 0; col < undistortedframe[0].cols; col++) {
+            float in[num];
+            for (int i = 0; i < num; i++) {
+                in[i] = 0.0f;
+                for (int bgr = 0; bgr < 3; bgr++) {
+                    in[i] += 255.0f
+                        * powf(static_cast<float>(undistortedframe[i].at<cv::Vec3b>(row, col)[bgr]) / 255.0f,
+                            gamma)
+                        / 3.0f;
+                }
+                sinusoidalwaves[i].at<float>(row, col) = in[i];
+            }
+            // *** in case of num == 3
+            calculateRphases3(in, &rphase.at<float>(row, col),
+            		  &amplitude.at<float>(row, col),
+            		  &(bias.at<float>(row, col)));
+        }
+    }
+
+    /* 縞波形、相対位相等表示・閾値処理 */
+    plotSinusoidalWaves(sinusoidalwaves, amplitude, bias, num);
+    plotRelativePhases(rphase, amplitude, bias);
+    thresholdAmplitudes(rphase, amplitude, threshold);
+
+    /* LUT読み込み */
+    cv::Mat LUTrphase[2], LUTcoordv[2];
+    if (!loadLUTs(LUTrphase, LUTcoordv)) {
+        std::cerr << "file (LUTs) open error" << std::endl;
+        return -1;
+    }
+
+    /* 三次元点群作成、保存 */
+    std::vector<double> x, y, z;
+    int steprow = 1, stepcol = 1;
+    convertRphasetoCoordv(rphase, x, y, z, LUTrphase, LUTcoordv, steprow, stepcol);
+    saveCoordv(x, y, z);
+
+    cv::destroyAllWindows();
+    return 0;
+}
+// end of program
